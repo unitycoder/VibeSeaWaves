@@ -1,0 +1,240 @@
+// OceanFFT.compute
+// Tessendorf-style FFT ocean simulation (JONSWAP spectrum), 3 cascades.
+// All kernels operate on Texture2DArrays with one slice per cascade.
+
+#pragma kernel PrecomputeTwiddle
+#pragma kernel InitialSpectrum
+#pragma kernel ConjugateSpectrum
+#pragma kernel TimeSpectrum
+#pragma kernel HorizontalIFFT
+#pragma kernel VerticalIFFT
+#pragma kernel AssembleMaps
+
+static const float PI = 3.14159265358979f;
+static const float G = 9.81f;
+
+uint Size;                 // FFT resolution (e.g. 256), power of two
+float4 LengthScales;       // world size of each cascade tile (m)
+float4 CutoffLow;          // per-cascade wavenumber band (avoids double counting)
+float4 CutoffHigh;
+
+// ---- spectrum parameters ----
+float  WindSpeed;          // m/s at 10 m
+float  Fetch;              // m
+float2 WindDirection;      // normalized xz
+float  Spread;             // 0 = isotropic, 1 = fully directional
+float  Gamma;              // JONSWAP peak enhancement (3.3 typical)
+float  Depth;              // water depth for dispersion (m)
+float  ShortWaveFade;      // suppresses waves shorter than ~this (m)
+float  AmplitudeMultiplier;
+
+// ---- per-frame ----
+float Time;
+float DeltaTime;
+float Lambda;              // horizontal choppiness
+float FoamDecay;           // how fast foam dissipates (1/s)
+
+Texture2D<float2>          Noise;       // gaussian N(0,1) pairs
+RWTexture2DArray<float4>   H0;          // xy = h0(k), zw = conj(h0(-k))
+RWTexture2DArray<float4>   WavesData;   // kx, 1/|k|, kz, omega
+
+// packed complex spectra / IFFT results (two real signals per texture)
+RWTexture2DArray<float2>   DxDz;
+RWTexture2DArray<float2>   DyDxz;
+RWTexture2DArray<float2>   DyxDyz;
+RWTexture2DArray<float2>   DxxDzz;
+
+// FFT working set
+RWTexture2D<float4>        TwiddleData; // logN x N butterfly texture
+RWTexture2DArray<float2>   Buffer0;
+RWTexture2DArray<float2>   Buffer1;
+uint Step;
+bool PingPong;             // true: read Buffer0, write Buffer1
+
+// final maps
+RWTexture2DArray<float4>   Displacement; // xyz world-space displacement
+RWTexture2DArray<float4>   Derivatives;  // dDy/dx, dDy/dz, L*dDx/dx, L*dDz/dz
+RWTexture2DArray<float>    Turbulence;   // accumulated min-Jacobian (foam)
+
+float2 ComplexMult(float2 a, float2 b)
+{
+    return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+float2 ComplexExp(float arg)
+{
+    return float2(cos(arg), sin(arg));
+}
+
+// ---------------------------------------------------------------- twiddle
+[numthreads(1, 8, 1)]
+void PrecomputeTwiddle(uint3 id : SV_DispatchThreadID)
+{
+    uint b = Size >> (id.x + 1);
+    uint i = (2 * b * (id.y / b) + id.y % b) % Size;
+    // positive exponent = inverse FFT
+    float2 twiddle = ComplexExp(2.0 * PI * (float)((id.y / b) * b) / (float)Size);
+    TwiddleData[id.xy]                        = float4( twiddle, (float)i, (float)(i + b));
+    TwiddleData[uint2(id.x, id.y + Size / 2)] = float4(-twiddle, (float)i, (float)(i + b));
+}
+
+// ---------------------------------------------------------------- spectrum
+float Frequency(float k)
+{
+    return sqrt(G * k * tanh(min(k * Depth, 20.0)));
+}
+
+float FrequencyDerivative(float k)
+{
+    float th = tanh(min(k * Depth, 20.0));
+    float w  = max(Frequency(k), 1e-4);
+    return G * (th + k * Depth * (1.0 - th * th)) / (2.0 * w);
+}
+
+float JONSWAP(float omega)
+{
+    float alpha  = 0.076 * pow(WindSpeed * WindSpeed / (Fetch * G), 0.22);
+    float omegaP = 22.0 * pow(G * G / (WindSpeed * Fetch), 1.0 / 3.0);
+    float sigma  = omega <= omegaP ? 0.07 : 0.09;
+    float r      = exp(-(omega - omegaP) * (omega - omegaP)
+                       / (2.0 * sigma * sigma * omegaP * omegaP));
+    float invW   = 1.0 / max(omega, 1e-3);
+    return alpha * G * G * pow(invW, 5)
+         * exp(-1.25 * pow(omegaP * invW, 4))
+         * pow(Gamma, r);
+}
+
+float DirectionSpectrum(float2 kDir)
+{
+    float c    = dot(kDir, WindDirection);
+    float lobe = pow(max(0.0, c), 2.0) + 0.03;      // forward lobe + isotropic floor
+    float back = c < 0.0 ? 1.0 - 0.85 * Spread : 1.0; // damp upwind waves
+    return lerp(1.0, 2.0 * lobe * back, Spread);
+}
+
+[numthreads(8, 8, 1)]
+void InitialSpectrum(uint3 id : SV_DispatchThreadID)
+{
+    float deltaK = 2.0 * PI / LengthScales[id.z];
+    float2 k     = ((float2)id.xy - (float)Size * 0.5) * deltaK;
+    float kLen   = length(k);
+    float kSafe  = max(kLen, 1e-5);
+
+    WavesData[id] = float4(k.x, 1.0 / kSafe, k.y, Frequency(kSafe));
+
+    if (kLen > CutoffLow[id.z] && kLen <= CutoffHigh[id.z] && kLen > 1e-5)
+    {
+        float omega  = Frequency(kLen);
+        float dOmega = FrequencyDerivative(kLen);
+        float S = JONSWAP(omega)
+                * DirectionSpectrum(k / kLen)
+                * exp(-kLen * kLen * ShortWaveFade * ShortWaveFade);
+        float amp = sqrt(2.0 * S * abs(dOmega) / kLen * deltaK * deltaK)
+                  * AmplitudeMultiplier;
+        H0[id] = float4(Noise[id.xy] * amp, 0, 0);
+    }
+    else
+    {
+        H0[id] = 0;
+    }
+}
+
+[numthreads(8, 8, 1)]
+void ConjugateSpectrum(uint3 id : SV_DispatchThreadID)
+{
+    float2 h0  = H0[id].xy;
+    uint2 idc  = uint2((Size - id.x) % Size, (Size - id.y) % Size);
+    float2 h0c = H0[uint3(idc, id.z)].xy;
+    H0[id] = float4(h0, h0c.x, -h0c.y);
+}
+
+// ------------------------------------------------------- time-dependent
+[numthreads(8, 8, 1)]
+void TimeSpectrum(uint3 id : SV_DispatchThreadID)
+{
+    float4 wave = WavesData[id];
+    float2 e    = ComplexExp(wave.w * Time);
+    float4 h0   = H0[id];
+
+    float2 h  = ComplexMult(h0.xy, e) + ComplexMult(h0.zw, float2(e.x, -e.y));
+    float2 ih = float2(-h.y, h.x);
+
+    float kx = wave.x, kz = wave.z, invK = wave.y;
+
+    float2 dispX   = ih * kx * invK;
+    float2 dispY   = h;
+    float2 dispZ   = ih * kz * invK;
+    float2 dX_dx   = -h * kx * kx * invK;
+    float2 dY_dx   = ih * kx;
+    float2 dX_dz   = -h * kx * kz * invK;   // == dDz/dx
+    float2 dY_dz   = ih * kz;
+    float2 dZ_dz   = -h * kz * kz * invK;
+
+    // pack two real signals a, b as complex a + i*b -> one IFFT recovers both
+    DxDz[id]   = float2(dispX.x - dispZ.y, dispX.y + dispZ.x);
+    DyDxz[id]  = float2(dispY.x - dX_dz.y, dispY.y + dX_dz.x);
+    DyxDyz[id] = float2(dY_dx.x - dY_dz.y, dY_dx.y + dY_dz.x);
+    DxxDzz[id] = float2(dX_dx.x - dZ_dz.y, dX_dx.y + dZ_dz.x);
+}
+
+// ---------------------------------------------------------------- IFFT
+[numthreads(8, 8, 1)]
+void HorizontalIFFT(uint3 id : SV_DispatchThreadID)
+{
+    float4 data = TwiddleData[uint2(Step, id.x)];
+    uint2 idx   = (uint2)data.zw;
+    if (PingPong)
+    {
+        float2 a = Buffer0[uint3(idx.x, id.y, id.z)];
+        float2 b = Buffer0[uint3(idx.y, id.y, id.z)];
+        Buffer1[id] = a + ComplexMult(data.xy, b);
+    }
+    else
+    {
+        float2 a = Buffer1[uint3(idx.x, id.y, id.z)];
+        float2 b = Buffer1[uint3(idx.y, id.y, id.z)];
+        Buffer0[id] = a + ComplexMult(data.xy, b);
+    }
+}
+
+[numthreads(8, 8, 1)]
+void VerticalIFFT(uint3 id : SV_DispatchThreadID)
+{
+    float4 data = TwiddleData[uint2(Step, id.y)];
+    uint2 idx   = (uint2)data.zw;
+    if (PingPong)
+    {
+        float2 a = Buffer0[uint3(id.x, idx.x, id.z)];
+        float2 b = Buffer0[uint3(id.x, idx.y, id.z)];
+        Buffer1[id] = a + ComplexMult(data.xy, b);
+    }
+    else
+    {
+        float2 a = Buffer1[uint3(id.x, idx.x, id.z)];
+        float2 b = Buffer1[uint3(id.x, idx.y, id.z)];
+        Buffer0[id] = a + ComplexMult(data.xy, b);
+    }
+}
+
+// ---------------------------------------------------------------- output
+[numthreads(8, 8, 1)]
+void AssembleMaps(uint3 id : SV_DispatchThreadID)
+{
+    // spectrum was centered around Size/2 -> undo the shift
+    float sign = 1.0 - 2.0 * ((id.x + id.y) & 1);
+
+    float2 dxdz   = DxDz[id]   * sign;
+    float2 dydxz  = DyDxz[id]  * sign;
+    float2 dyxdyz = DyxDyz[id] * sign;
+    float2 dxxdzz = DxxDzz[id] * sign;
+
+    Displacement[id] = float4(Lambda * dxdz.x, dydxz.x, Lambda * dxdz.y, 0);
+    Derivatives[id]  = float4(dyxdyz, dxxdzz * Lambda);
+
+    // Jacobian of the horizontal displacement -> folding == whitecaps
+    float jacobian = (1.0 + Lambda * dxxdzz.x) * (1.0 + Lambda * dxxdzz.y)
+                   - Lambda * Lambda * dydxz.y * dydxz.y;
+
+    float turb = Turbulence[id] + DeltaTime * FoamDecay;
+    Turbulence[id] = min(turb, jacobian);
+}
