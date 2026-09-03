@@ -1,3 +1,5 @@
+<img src="https://img.shields.io/badge/VibeCoded-100%25-green" alt="AI Generated Content"/>
+
 # VibeSeaWaves
 
 Fable AI generated 1 shot ocean shader.
